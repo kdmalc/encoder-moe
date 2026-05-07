@@ -1,4 +1,4 @@
-# Code for: [Paper Title]
+# Code for: EncoderMoE: Classifying User-Defined Gestures Using MoE Encoders and Meta-Learning
 
 *NeurIPS 2026 Submission — Anonymous*
 
@@ -18,7 +18,7 @@ system adapts to new users from a single labeled trial per gesture class
 routing, trained end-to-end with episodic meta-learning. Inputs are
 multimodal: 16-channel surface EMG + 72-channel IMU, windowed at 64 time steps.
 
-The primary model (**M0**) and all ablations are in the root directory.
+The primary model (**M0**, EncoderMoE) and all ablations are in the root directory.
 `ablation_config.py` is the single source of truth for all hyperparameters;
 individual scripts only override what their ablation changes.
 
