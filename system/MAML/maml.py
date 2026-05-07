@@ -1,0 +1,310 @@
+# === MAML core (Original) =====================================================
+import copy
+from collections import OrderedDict
+import torch
+import torch.nn as nn
+import time
+
+# Reusing your existing project-specific routers and logic
+from system.MOE.MOE_training import _model_forward_router, set_MOE_optimizer, SmoothedEarlyStopping
+from system.MAML.shared_maml import *
+
+# -----------------------------
+# Functional execution helpers
+# -----------------------------
+def named_param_dict(module: nn.Module) -> OrderedDict:
+    """Extracts parameters that require gradients."""
+    return OrderedDict((name, p) for name, p in module.named_parameters() if p.requires_grad)
+
+class FunctionalModel(nn.Module):
+    """Wraps a base module for functional forward passes."""
+    def __init__(self, base: nn.Module, params: OrderedDict):
+        super().__init__()
+        self.base = base
+        self.params = params
+    def forward(self, *args, **kwargs):
+        return torch.func.functional_call(self.base, self.params, args, kwargs)
+
+def apply_gradient_update(params, grads, alpha):
+    """Simple SGD update: theta' = theta - alpha * grad"""
+    new_params = OrderedDict()
+    for (name, p), g in zip(params.items(), grads):
+        if g is None:
+            new_params[name] = p
+        else:
+            new_params[name] = p - alpha * g
+    return new_params
+
+# -----------------------------
+# Inner loop (Original MAML)
+# -----------------------------
+def inner_loop_maml(
+    model: nn.Module,
+    theta0: OrderedDict,
+    support_batch,
+    config,
+    *,
+    criterion
+):
+    """
+    Performs N steps of gradient descent on the support set.
+    Returns the adapted parameters (theta_prime).
+    """
+    device = config['device']
+    multimodal = config.get('multimodal', False)
+    inner_steps = int(config['maml_inner_steps'])
+    alpha = float(config['maml_alpha_init'])  # NOTE: This is our MAML learning rate! Need to unify this with learning_rate ...
+
+    # We can still have first or second order MAML --> This is not MAML++ specific!
+    use_second_order = (config['maml_opt_order'] == "second")
+
+    params_i = theta0
+
+    for step in range(inner_steps):
+        # Forward pass on support set
+        f_s = FunctionalModel(model, params_i)
+        outputs_s, labels_s, _ = _model_forward_router(f_s, support_batch, device, multimodal=multimodal)
+        logits_s = outputs_s[0] if isinstance(outputs_s, tuple) else outputs_s
+        s_loss = criterion(logits_s, labels_s)
+        
+        # Calculate gradients
+        # create_graph=True allows us to take gradients of gradients (Meta-Optimization)
+        grads = torch.autograd.grad(
+            s_loss,
+            list(params_i.values()),
+            create_graph=use_second_order,
+            retain_graph=use_second_order,
+            allow_unused=True,
+        )
+        
+        # Manual SGD Update
+        params_i = apply_gradient_update(params_i, grads, alpha)
+
+    return params_i
+
+# -----------------------------
+# Training logic
+# -----------------------------
+def train_MAML_one_epoch(model, episodic_loader, meta_opt, config, criterion=None):
+    device = config['device']
+    model.train()
+
+    if criterion is None:
+        label_smooth = float(config.get("label_smooth", 0.0))
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smooth)
+
+    meta_batchsize = int(config["meta_batchsize"])
+    episodes_per_epoch = int(config.get("episodes_per_epoch_train", 0))
+    multimodal = config.get('multimodal', False)
+
+    meta_correct = meta_total = loss_sum = n_episodes = accum_count = 0
+    meta_opt.zero_grad(set_to_none=True)
+
+    for step_item in episodic_loader:
+        # Standardize input format
+        episodes = [step_item] if isinstance(step_item, dict) else step_item
+
+        for episode in episodes:
+            # 1. Adapt on Support Set
+            theta0 = named_param_dict(model)
+            theta_prime = inner_loop_maml(model, theta0, episode["support"], config, criterion=criterion)
+
+            # 2. Evaluate on Query Set (Meta-Loss)
+            f_q = FunctionalModel(model, theta_prime)
+            outputs_q, labels_q, _ = _model_forward_router(f_q, episode["query"], device, multimodal=multimodal)
+            logits_q = outputs_q[0] if isinstance(outputs_q, tuple) else outputs_q
+            meta_loss_task = criterion(logits_q, labels_q)
+
+            # 3. Metrics (No grad for logging)
+            with torch.no_grad():
+                preds = logits_q.argmax(dim=1)
+                meta_correct += (preds == labels_q).sum().item()
+                meta_total += labels_q.numel()
+                loss_sum += float(meta_loss_task.item())
+
+            # 4. Accumulate Gradients
+            (meta_loss_task / meta_batchsize).backward()
+            accum_count += 1
+            n_episodes += 1
+
+            # 5. Outer Optimizer Step
+            if accum_count == meta_batchsize:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['gradient_clip_max_norm'])
+                meta_opt.step()
+                meta_opt.zero_grad(set_to_none=True)
+                accum_count = 0
+
+            if episodes_per_epoch and n_episodes >= episodes_per_epoch:
+                break
+        if episodes_per_epoch and n_episodes >= episodes_per_epoch:
+            break
+
+    # Final step for remaining episodes
+    if accum_count > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['gradient_clip_max_norm'])
+        meta_opt.step()
+        meta_opt.zero_grad(set_to_none=True)
+
+    return {"loss": loss_sum / max(n_episodes, 1), "acc": meta_correct / max(meta_total, 1)}
+
+# -----------------------------
+# Top-Level Pretraining Pipeline
+# -----------------------------
+def maml_pretrain(model, config, episodic_train_loader, episodic_val_loader=None):
+    device = config["device"]
+    model.to(device)
+
+    # Re-using your specific MOE optimizer setter
+    meta_opt = set_MOE_optimizer(
+        model,
+        lr=float(config["learning_rate"]),
+        use_weight_decay=float(config.get("weight_decay", 0)) > 0.0,
+        weight_decay=float(config.get("weight_decay", 0)),
+        optimizer_name=config["optimizer"],
+    )
+
+    scheduler = None  # Learning rate scheduler... would this be for beta, or alpha, or both...
+    if bool(config.get("use_cosine_outer_lr", False)):  # TODO: Is this used right now...
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(meta_opt, T_max=int(config["num_epochs"]))
+
+    use_es = episodic_val_loader is not None and bool(config["use_earlystopping"])
+    early_stopping = None
+    if use_es:
+        early_stopping = SmoothedEarlyStopping(
+            patience=int(config["earlystopping_patience"]),
+            min_delta=float(config["earlystopping_min_delta"]),
+        )
+
+    best_val_acc, best_state, best_val_epoch = -1.0, None, 0
+    train_loss_log, train_acc_log, val_loss_log, val_acc_log = [], [], [], []
+
+    for ep in range(1, int(config["num_epochs"]) + 1):
+        print(f"--- MAML Epoch {ep} ---")
+        epoch_start_time = time.time()
+        
+        # Train
+        t_metrics = train_MAML_one_epoch(model, episodic_train_loader, meta_opt, config)
+        train_loss_log.append(t_metrics["loss"])
+        train_acc_log.append(t_metrics["acc"])
+        print(f"Train Loss: {t_metrics['loss']:.4f} | Acc: {t_metrics['acc']*100:.2f}%")
+
+        # Val
+        if episodic_val_loader is not None:
+            val_start_time = time.time()
+            val_metrics = meta_evaluate(model, episodic_val_loader, config, maml_adapt_and_eval)
+            cur_val_loss, cur_val_acc = val_metrics["loss"], val_metrics["acc"]
+            val_loss_log.append(cur_val_loss)
+            val_acc_log.append(cur_val_acc)
+            print(f"Val completed in {time.time() - val_start_time:.2f}s")
+            print(f"Val loss/acc: {cur_val_loss:.4f}, {cur_val_acc*100:.2f}%")
+
+            if cur_val_acc > best_val_acc:
+                best_val_acc = cur_val_acc
+                best_state = copy.deepcopy(model.state_dict())
+                best_val_epoch = ep
+
+            if use_es and early_stopping(cur_val_loss):
+                print(f"[EarlyStopping] epoch {ep}: val loss stalled. Stopping.")
+                if scheduler: scheduler.step()
+                break
+        else:
+            print("No val loader found! Skipping during-training val evals")
+
+        if scheduler: scheduler.step()
+        print(f"Epoch completed in {time.time() - epoch_start_time:.2f}s\n")
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"[MAML] loaded best model (val acc={best_val_acc:.3f})")
+
+    return model, {
+        "train_loss_log": train_loss_log,
+        "train_acc_log":  train_acc_log,
+        "val_loss_log":   val_loss_log,
+        "val_acc_log":    val_acc_log,
+        "model": model,
+        "best_state": best_state,
+        "best_val_acc": best_val_acc,
+        "best_val_epoch": best_val_epoch
+    }
+
+# -----------------------------
+# Meta-Evaluation
+# -----------------------------
+@torch.no_grad()
+def maml_predict(model, adapted_params, batch, config):
+    """Simple prediction using adapted parameters."""
+    device = config['device']
+
+    # Switch to eval for deterministic prediction (Dropout off, etc.)
+    # WARNING: If using BatchNorm, this uses global stats, not query stats!
+    model.to(device).eval() 
+
+    fmodel = FunctionalModel(model, adapted_params)
+    outputs, labels, B = _model_forward_router(fmodel, batch, device, multimodal=config.get('multimodal', False))
+    logits = outputs[0] if isinstance(outputs, tuple) else outputs
+    
+    # Revert base model to train immediately to prevent silent state bugs in next episode
+    model.train() 
+    
+    return logits, torch.argmax(logits, dim=1), labels, B
+
+def maml_adapt(model, config, support_batch, criterion=None):
+    """
+    Inner loop adaptation for standard MAML.
+    """
+    # CRITICAL: Keep model in train mode for LSTM gradient support
+    model.train() 
+    device = config['device']
+    multimodal = config["multimodal"]
+    
+    # Hyperparams for eval adaptation
+    steps = config.get('maml_inner_steps_eval', config.get('maml_inner_steps', 1))
+    alpha = config.get('maml_alpha_init_eval', config.get('maml_alpha_init', 0.01))
+
+    # Initial weights
+    theta = named_param_dict(model)
+
+    if criterion is None:
+        label_smooth = float(config["label_smooth"])
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smooth) if label_smooth > 0 else nn.CrossEntropyLoss()
+
+    for _ in range(steps):
+        # Create the functional wrapper
+        f_model = FunctionalModel(model, theta)
+        # Forward pass on support set
+        outputs_s, labels_s, _ = _model_forward_router(f_model, support_batch, device, multimodal=multimodal)
+        logits_s = outputs_s[0] if isinstance(outputs_s, tuple) else outputs_s
+        
+        loss = criterion(logits_s, labels_s)
+        # Compute gradients wrt current theta
+        grads = torch.autograd.grad(loss, list(theta.values()), create_graph=False, allow_unused=True)
+        # Update theta: theta' = theta - alpha * grads
+        theta = apply_gradient_update(theta, grads, alpha)
+        
+    return theta
+
+def maml_adapt_and_eval(model, config, support_batch, query_batch):
+    """
+    Adapts and evaluates for standard MAML. 
+    Matches the signature of mamlpp_adapt_and_eval.
+    """
+    label_smooth = float(config.get("label_smooth", 0.0))
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smooth) if label_smooth > 0 else nn.CrossEntropyLoss()
+
+    # 1. Adapt on support set
+    theta_prime = maml_adapt(model, config, support_batch, criterion)
+
+    # 2. Predict on query set
+    # Using the maml_predict function you already wrote
+    logits, preds, labels, B = maml_predict(model, theta_prime, query_batch, config)
+
+    # 3. Calculate metrics
+    q_loss = criterion(logits, labels).item()
+    acc = (preds == labels).sum().item() / max(1, B)
+
+    return {
+        "loss": q_loss, 
+        "acc": acc, 
+        "adapted_params": theta_prime
+    }

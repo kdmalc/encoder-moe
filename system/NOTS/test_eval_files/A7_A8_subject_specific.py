@@ -1,0 +1,699 @@
+# A7_A8_subject_specific.py
+"""
+A7_A8_subject_specific.py
+==========================
+Ablations A7 and A8: Subject-Specific Models
+
+test_procedure:
+  'hpo_test_split' : Evaluate only on the fixed TEST_PIDS (development).
+  'L2SO'           : Evaluate on ALL all_PIDs so subject coverage matches
+                     the L2SO cross-subject ablations (M0, A1–A4).
+                     Rep-level logic is unchanged — this only controls
+                     which subjects are included in the outer loop.
+
+NOTE: Subject-specific models have no cross-subject training phase.
+The subject-level loop here is over evaluation subjects only.
+Val/test splits are over REPS within each subject, not over subjects.
+
+seed_idx is fixed to 0 (single run per subject, consistent with all other
+ablations). This means train rep = 1, val rep = 2, test reps = 3–10.
+
+A7 reports BOTH head_only and full_ft (identical to A1/A2).
+  - Model: supervised CNN-LSTM, no MoE.
+  - Training: flat supervised pretraining on a single subject's train rep.
+  - Eval: episodic finetune-then-eval (head_only and full_ft).
+
+A8 uses supervised pretraining (same procedure as A7) on the full MoE model,
+then evaluates using mamlpp_adapt_and_eval (MAML inner-loop test-time
+adaptation). This isolates the question: does cross-subject MAML pretraining
+(M0) provide a better initialisation than subject-specific supervised
+pretraining for MAML inner-loop adaptation?
+
+Training procedure for A8:
+  1. Build build_maml_moe_model with meta_learning=False so the head has
+     pretrain_num_classes (=10) output logits for supervised cross-entropy.
+  2. Run flat supervised pretrain() on the subject's single train rep.
+  3. Call replace_head_for_eval() to swap the 10-class head for a fresh
+     n_way (=3) head, and set meta_learning=True in config.
+  4. Run mamlpp_adapt_and_eval (MAML inner-loop steps) at test time.
+"""
+
+import os, sys, copy, json, argparse
+import numpy as np
+import torch
+import pickle
+import random
+from collections import defaultdict
+
+from pathlib import Path
+CODE_DIR = Path(os.environ.get("CODE_DIR", "./")).resolve()
+sys.path.insert(0, str(CODE_DIR))
+sys.path.insert(0, str(CODE_DIR / "system"))
+sys.path.insert(0, str(CODE_DIR / "system" / "MAML"))
+sys.path.insert(0, str(CODE_DIR / "system" / "MOE"))
+sys.path.insert(0, str(CODE_DIR / "system" / "pretraining"))
+
+from ablation_config import (
+    make_base_config, build_supervised_no_moe_model, build_maml_moe_model,
+    replace_head_for_eval,
+    set_seeds, FIXED_SEED, NUM_TEST_EPISODES,
+    save_results, save_model_checkpoint, count_parameters, RUN_DIR,
+    compute_matched_filters_for_ablation,
+)
+from pretraining.pretrain_data_pipeline import get_pretrain_dataloaders
+from pretraining.pretrain_trainer import pretrain
+from pretraining.pretrain_finetune import finetune_and_eval_user
+from MAML.maml_data_pipeline import maml_mm_collate, reorient_tensor_dict
+from MAML.mamlpp import mamlpp_adapt_and_eval
+
+print(f"CUDA Available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+ALL_TRIAL_INDICES_0INDEXED = list(range(10))
+NUM_REPS = len(ALL_TRIAL_INDICES_0INDEXED)
+A7_PRETRAIN_EPOCHS = 100
+A8_PRETRAIN_EPOCHS = 100
+
+# Fixed seed_idx = 0: train rep=1, val rep=2, test reps=3–10.
+# Changing this would rotate which rep is used for support/train, which is a
+# data-split change — not a seed sweep. Keep at 0 for a single deterministic run.
+FIXED_SEED_IDX = 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Episode building helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_ss_episode(
+    tensor_dict, pid, gesture_classes, support_trial_idx,
+    query_trial_indices, use_imu, device,
+):
+    assert support_trial_idx not in query_trial_indices, (
+        f"support_trial_idx={support_trial_idx} appears in query_trial_indices={query_trial_indices}."
+    )
+
+    support_emg_list, support_imu_list, support_label_list = [], [], []
+    query_emg_list,   query_imu_list,   query_label_list   = [], [], []
+
+    for local_label, cls in enumerate(gesture_classes):
+        slot    = tensor_dict[pid][cls]
+        emg_all = slot["emg"]
+        imu_all = slot["imu"]
+
+        num_trials = emg_all.shape[0]
+        assert support_trial_idx < num_trials, (
+            f"support_trial_idx={support_trial_idx} out of range for "
+            f"pid={pid}, class={cls} which has {num_trials} trials."
+        )
+
+        support_emg_list.append(emg_all[support_trial_idx].float())
+        if imu_all is not None:
+            support_imu_list.append(imu_all[support_trial_idx].float())
+        support_label_list.append(local_label)
+
+        for q_idx in query_trial_indices:
+            assert q_idx < num_trials, (
+                f"query_trial_idx={q_idx} out of range for pid={pid}, class={cls}."
+            )
+            query_emg_list.append(emg_all[q_idx].float())
+            if imu_all is not None:
+                query_imu_list.append(imu_all[q_idx].float())
+            query_label_list.append(local_label)
+
+    support_emg    = torch.stack(support_emg_list).to(device)
+    query_emg      = torch.stack(query_emg_list).to(device)
+    support_labels = torch.tensor(support_label_list, dtype=torch.long).to(device)
+    query_labels   = torch.tensor(query_label_list,   dtype=torch.long).to(device)
+
+    support_imu = None
+    query_imu   = None
+    if support_imu_list:
+        support_imu = torch.stack(support_imu_list).to(device)
+        query_imu   = torch.stack(query_imu_list).to(device)
+
+    return {
+        "support_emg":    support_emg,
+        "support_imu":    support_imu,
+        "support_labels": support_labels,
+        "query_emg":      query_emg,
+        "query_imu":      query_imu,
+        "query_labels":   query_labels,
+    }
+
+
+def build_ss_eval_episodes(tensor_dict, pid, config, support_trial_idx,
+                            query_trial_indices, num_episodes, seed):
+    gesture_classes = config["maml_gesture_classes"]
+    n_way           = config["n_way"]
+    use_imu         = config["use_imu"]
+    device          = config["device"]
+
+    from itertools import combinations
+    all_combos = list(combinations(sorted(gesture_classes), n_way))
+
+    ep_rng = random.Random(seed)
+    ep_rng.shuffle(all_combos)
+
+    episodes = []
+    for ep_idx in range(num_episodes):
+        classes = list(all_combos[ep_idx % len(all_combos)])
+        ep = build_ss_episode(
+            tensor_dict, pid, classes,
+            support_trial_idx, query_trial_indices,
+            use_imu, device,
+        )
+        episodes.append(ep)
+
+    return episodes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A7 config + per-subject runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_config_a7() -> dict:
+    """
+    A7 config: M0's HPO values inherited; only ablation-defining flags set.
+
+    Justified deviations from M0 (not HPO-tuned values, structurally necessary):
+      batch_size = 10    : subject-specific training has only 10 samples
+                           (1 rep × 10 gestures). M0's batch_size=64 is
+                           impossible here — this is a data constraint, not a HP.
+      num_epochs = A7_PRETRAIN_EPOCHS (100): subject-specific models see far
+                           less data per epoch, requiring more epochs to converge.
+      use_earlystopping = True / earlystopping_patience = 20: necessary to
+                           prevent overfitting on 10 training samples.
+
+    Eval-time adaptation mirrors M0's MAML inner-loop eval exactly:
+      ft_steps      = maml_inner_steps_eval  (same number of gradient steps)
+      ft_lr         = maml_alpha_init_eval   (same per-step learning rate)
+      ft_optimizer  = "sgd"                  (MAML inner loop is SGD:
+                                              theta' = theta - alpha * grad)
+      ft_weight_decay = 0.0                  (MAML inner loop has no WD)
+
+    Parameter matching:
+      A7's CNN encoder is scaled to match ALL of M0's expert CNNs combined,
+      identical to A2. This is required because A7 is the subject-specific
+      counterpart to A2 — they must have the same architecture so that the
+      only variable is cross-subject vs. subject-specific training.
+    """
+    config = make_base_config(ablation_id="A7")
+
+    # ── Ablation-defining overrides ───────────────────────────────────────────
+    config["subject_specific_model"] = True
+    config["meta_learning"]          = False
+    config["use_MOE"]                = False
+
+    # ── Structurally necessary deviations (data constraint, not HPO) ─────────
+    config["batch_size"]             = 10             # only 10 training samples
+    config["num_epochs"]             = A7_PRETRAIN_EPOCHS
+    config["use_earlystopping"]      = True
+    config["earlystopping_patience"] = 20
+
+    # ── Eval-time adaptation: mirror M0's MAML inner-loop eval exactly ───────
+    config["ft_steps"]               = config["maml_inner_steps_eval"]  # = 10
+    config["ft_lr"]                  = config["maml_alpha_init_eval"]   # = 5.066e-3
+    config["ft_optimizer"]           = "sgd"   # MAML inner loop is SGD: theta' = theta - alpha*grad
+    config["ft_weight_decay"]        = 0.0    # MAML inner loop has no weight decay
+
+    # ── Parameter matching ────────────────────────────────────────────────────
+    # Target: SUM of all M0 expert CNN params (same target as A2).
+    # A7 is the subject-specific counterpart to A2, so they must share the
+    # same encoder architecture — the only difference is training regime
+    # (per-subject vs. cross-subject). LSTM and head are excluded from the
+    # match, as they are identical across all models.
+    match_info = compute_matched_filters_for_ablation(
+        ablation_id="A7",
+        ablation_config=config,
+        match_target="all_experts",
+    )
+    config["cnn_base_filters"] = match_info["matched_filters"]
+
+    # Stash matching metadata for the saved config snapshot / auditing
+    config["_param_match_target"]          = "all_experts_cnn"
+    config["_m0_total_params"]             = match_info["m0_total_params"]
+    config["_m0_all_expert_params"]        = match_info["m0_all_expert_params"]
+    config["_m0_one_expert_params"]        = match_info["m0_one_expert_params"]
+    config["_a7_matched_cnn_params"]       = match_info["matched_cnn_params"]
+    config["_a7_total_params_after_match"] = match_info["matched_total_params"]
+    config["_a7_param_ratio"]              = match_info["param_ratio"]
+
+    return config
+
+
+def run_a7_one_subject(pid, config, tensor_dict):
+    seed     = FIXED_SEED
+    seed_idx = FIXED_SEED_IDX
+
+    set_seeds(seed)
+    config = copy.deepcopy(config)
+    config["seed"] = seed
+
+    train_trial_idx    = seed_idx % NUM_REPS
+    val_trial_idx      = (seed_idx + 1) % NUM_REPS
+    test_trial_indices = [
+        i for i in ALL_TRIAL_INDICES_0INDEXED
+        if i != train_trial_idx and i != val_trial_idx
+    ]
+    assert len(test_trial_indices) == NUM_REPS - 2
+
+    train_rep_num     = train_trial_idx + 1
+    val_rep_num       = val_trial_idx   + 1
+    support_trial_idx = train_trial_idx
+
+    print(f"[A7 | {pid}] "
+          f"Train rep: {train_rep_num} | Val rep: {val_rep_num} | "
+          f"Test reps: {[i+1 for i in test_trial_indices]}")
+
+    config["train_PIDs"] = [pid]
+    config["val_PIDs"]   = [pid]
+    config["train_reps"] = [train_rep_num]
+    config["val_reps"]   = [val_rep_num]
+
+    model = build_supervised_no_moe_model(config)
+    train_dl, val_dl, n_classes = get_pretrain_dataloaders(config, tensor_dict)
+    assert len(train_dl.dataset) > 0, (
+        f"[A7 | {pid}] Empty train set."
+    )
+
+    trained_model, history = pretrain(model, train_dl, val_dl, config)
+
+    # pretrain_trainer does NOT track best weights — it returns the final epoch.
+    # Reconstruct best val acc from the history logs.
+    val_accs = history["val_acc"]
+    assert len(val_accs) > 0, f"[A7 | {pid}] val_acc log is empty after pretrain."
+    best_val_acc = float(max(val_accs))
+    best_epoch   = int(np.argmax(val_accs))
+
+    # We can't recover the best-epoch weights post-hoc from history alone,
+    # so we save the final model and flag clearly that it is NOT the best-epoch model.
+    # To fix properly, pretrain_trainer needs to stash best state_dict internally.
+    print(f"[A7 | {pid}] WARNING: saving FINAL epoch weights, not best-epoch weights. "
+          f"Best val acc {best_val_acc*100:.2f}% was at epoch {best_epoch}. "
+          f"Final val acc {val_accs[-1]*100:.2f}%. "
+          f"Fix pretrain_trainer to return best_state if this matters.")
+
+    save_model_checkpoint(
+        {
+            "ablation_id":     "A7",
+            "pid":             pid,
+            "seed":            seed,
+            "seed_idx":        seed_idx,
+            "model_state_dict": trained_model.state_dict(),  # final epoch, NOT best epoch
+            "config":          config,
+            "best_val_acc":    best_val_acc,
+            "best_epoch":      best_epoch,
+            "train_loss":      history["train_loss"],
+            "train_acc":       history["train_acc"],
+            "val_loss":        history["val_loss"],
+            "val_acc":         history["val_acc"],
+            "train_aux_loss":  history["train_aux_loss"],
+            "val_aux_loss":    history["val_aux_loss"],
+            "routing_reports": history["routing_reports"],
+            "note":            "model_state_dict is FINAL epoch, not best-val epoch. "
+                               "pretrain_trainer must be updated to fix this.",
+        },
+        config,
+        tag=f"A7_pid{pid}_seed{seed}_best",
+    )
+
+    episodes = build_ss_eval_episodes(
+        tensor_dict, pid, config,
+        support_trial_idx   = support_trial_idx,
+        query_trial_indices = test_trial_indices,
+        num_episodes        = NUM_TEST_EPISODES,
+        seed                = seed,
+    )
+
+    head_accs = []
+    full_accs = []
+    for ep in episodes:
+        head_metrics = finetune_and_eval_user(
+            trained_model, config,
+            support_emg    = ep["support_emg"],
+            support_imu    = ep["support_imu"],
+            support_labels = ep["support_labels"],
+            query_emg      = ep["query_emg"],
+            query_imu      = ep["query_imu"],
+            query_labels   = ep["query_labels"],
+            mode           = "head_only",
+        )
+        full_metrics = finetune_and_eval_user(
+            trained_model, config,
+            support_emg    = ep["support_emg"],
+            support_imu    = ep["support_imu"],
+            support_labels = ep["support_labels"],
+            query_emg      = ep["query_emg"],
+            query_imu      = ep["query_imu"],
+            query_labels   = ep["query_labels"],
+            mode           = "full",
+        )
+        head_accs.append(head_metrics["acc"])
+        full_accs.append(full_metrics["acc"])
+
+    mean_head_acc = float(np.mean(head_accs))
+    mean_full_acc = float(np.mean(full_accs))
+    print(f"[A7 | {pid}] head-only: {mean_head_acc*100:.2f}%  "
+          f"full-ft: {mean_full_acc*100:.2f}%")
+
+    return {
+        "pid":            pid,
+        "seed":           seed,
+        "seed_idx":       seed_idx,
+        "train_rep_num":  train_rep_num,
+        "val_rep_num":    val_rep_num,
+        "mean_head_acc":  mean_head_acc,
+        "mean_full_acc":  mean_full_acc,
+        # Keep mean_acc pointing to full_ft for compatibility with A8's shared
+        # orchestrator (run_subject_specific_ablation aggregates on "mean_acc").
+        # The orchestrator is overridden for A7 below.
+        "n_episodes":     len(head_accs),
+        "n_params":       count_parameters(model),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A8 config + per-subject runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_config_a8() -> dict:
+    """
+    A8 config: M0's HPO values inherited; only ablation-defining flags set.
+
+    A8 uses MAML inner-loop adaptation at eval time (mamlpp_adapt_and_eval),
+    NOT gradient finetuning — so no ft_* keys are needed. The MAML inner-loop
+    LR (maml_alpha_init_eval) and step count (maml_inner_steps_eval) are
+    inherited from make_base_config() / M0's Trial 89 values.
+
+    Justified deviations from M0 (data constraint, not HPO):
+      batch_size = 10    : only 10 training samples (1 rep × 10 gestures)
+      num_epochs = A8_PRETRAIN_EPOCHS (100): far less data per epoch
+      use_earlystopping = True / earlystopping_patience = 20: prevent overfit
+    """
+    config = make_base_config(ablation_id="A8")
+    config["subject_specific_model"]  = True
+    # meta_learning=False during the supervised pretraining phase so the model
+    # is built with a pretrain_num_classes (=10) head for cross-entropy over
+    # all gesture classes. It will be flipped to True and the head replaced
+    # before MAML test-time eval (see run_a8_one_subject).
+    config["meta_learning"]           = False
+    config["use_MOE"]                 = True   # full MoE model, same architecture as M0
+    config["batch_size"]              = 10
+    config["num_epochs"]              = A8_PRETRAIN_EPOCHS
+    config["use_earlystopping"]       = True
+    config["earlystopping_patience"]  = 20
+    return config
+
+
+def run_a8_one_subject(pid, config, tensor_dict):
+    seed     = FIXED_SEED
+    seed_idx = FIXED_SEED_IDX
+
+    set_seeds(seed)
+    config = copy.deepcopy(config)
+    config["seed"] = seed
+
+    # Same rep assignment as A7: train=rep1, val=rep2, test=reps3-10.
+    # support_trial_idx (= train rep) is what the MAML inner loop adapts from
+    # at eval time — identical to A7 so the support set is the same rep.
+    train_trial_idx    = seed_idx % NUM_REPS
+    val_trial_idx      = (seed_idx + 1) % NUM_REPS
+    test_trial_indices = [
+        i for i in ALL_TRIAL_INDICES_0INDEXED
+        if i != train_trial_idx and i != val_trial_idx
+    ]
+    assert len(test_trial_indices) == NUM_REPS - 2
+
+    train_rep_num     = train_trial_idx + 1
+    val_rep_num       = val_trial_idx   + 1
+    support_trial_idx = train_trial_idx
+
+    print(f"[A8 | {pid}] "
+          f"Train rep: {train_rep_num} | Val rep: {val_rep_num} | "
+          f"Test reps: {[i+1 for i in test_trial_indices]} | "
+          f"Support rep (MAML eval): {train_rep_num}")
+
+    # ── Phase 1: supervised pretraining on this subject's single train rep ──
+    # meta_learning=False means the MoE model is built with a 10-class head.
+    config["train_PIDs"] = [pid]
+    config["val_PIDs"]   = [pid]
+    config["train_reps"] = [train_rep_num]
+    config["val_reps"]   = [val_rep_num]
+
+    # build_maml_moe_model reads meta_learning from config; since we set it to
+    # False above the model will be initialised with a pretrain_num_classes head.
+    model = build_maml_moe_model(config)
+    train_dl, val_dl, n_classes = get_pretrain_dataloaders(config, tensor_dict)
+    assert len(train_dl.dataset) > 0, (
+        f"[A8 | {pid}] Empty train set."
+    )
+
+    trained_model, history = pretrain(model, train_dl, val_dl, config)
+
+    val_accs     = history["val_acc"]
+    assert len(val_accs) > 0, f"[A8 | {pid}] val_acc log is empty after pretrain."
+    best_val_acc = float(max(val_accs))
+    best_epoch   = int(np.argmax(val_accs))
+
+    print(f"[A8 | {pid}] Pretraining complete. "
+          f"Best val acc {best_val_acc*100:.2f}% at epoch {best_epoch}. "
+          f"Final val acc {val_accs[-1]*100:.2f}%.")
+
+    save_model_checkpoint(
+        {
+            "ablation_id":      "A8",
+            "pid":              pid,
+            "seed":             seed,
+            "seed_idx":         seed_idx,
+            "model_state_dict": trained_model.state_dict(),
+            "config":           config,
+            "best_val_acc":     best_val_acc,
+            "best_epoch":       best_epoch,
+            "train_loss":       history["train_loss"],
+            "train_acc":        history["train_acc"],
+            "val_loss":         history["val_loss"],
+            "val_acc":          history["val_acc"],
+            "train_aux_loss":   history["train_aux_loss"],
+            "val_aux_loss":     history["val_aux_loss"],
+            "routing_reports":  history["routing_reports"],
+            "note":             "Supervised pretrain weights (10-class head). "
+                                "Head replaced to n_way=3 before MAML eval.",
+        },
+        config,
+        tag=f"A8_pid{pid}_seed{seed}_pretrain",
+    )
+
+    # ── Phase 2: replace head and switch to MAML eval mode ──────────────────
+    # replace_head_for_eval swaps the 10-class supervised head for a fresh
+    # n_way (=3) head. The backbone weights are untouched.
+    trained_model = replace_head_for_eval(trained_model, config)
+    # Now flip meta_learning so that mamlpp_adapt_and_eval sees the correct
+    # config state (n_way head, MAML inner-loop logic).
+    config["meta_learning"] = True
+
+    # ── Phase 3: MAML inner-loop test-time eval ──────────────────────────────
+    episodes = build_ss_eval_episodes(
+        tensor_dict, pid, config,
+        support_trial_idx   = support_trial_idx,
+        query_trial_indices = test_trial_indices,
+        num_episodes        = NUM_TEST_EPISODES,
+        seed                = seed,
+    )
+
+    episode_accs = []
+    for ep in episodes:
+        batch = {
+            "support": {
+                "emg":    ep["support_emg"],
+                "imu":    ep["support_imu"],
+                "labels": ep["support_labels"],
+            },
+            "query": {
+                "emg":    ep["query_emg"],
+                "imu":    ep["query_imu"],
+                "labels": ep["query_labels"],
+            },
+        }
+        metrics = mamlpp_adapt_and_eval(trained_model, config, batch["support"], batch["query"])
+        episode_accs.append(metrics["acc"])
+
+    mean_acc = float(np.mean(episode_accs))
+    print(f"[A8 | {pid}] Acc: {mean_acc*100:.2f}%")
+
+    return {
+        "pid":             pid,
+        "seed":            seed,
+        "seed_idx":        seed_idx,
+        "train_rep_num":   train_rep_num,
+        "val_rep_num":     val_rep_num,
+        "support_rep_num": train_rep_num,
+        "best_val_acc":    best_val_acc,
+        "mean_acc":        mean_acc,
+        "n_episodes":      len(episode_accs),
+        "n_params":        count_parameters(trained_model),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Orchestration
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_a7_ablation(config, tensor_dict):
+    """
+    A7-specific orchestrator. Aggregates both head_only and full_ft across
+    subjects and saves a summary with both metrics (matching A1/A2 structure).
+    """
+    test_procedure = config["test_procedure"]
+    assert test_procedure in ("hpo_test_split", "L2SO"), (
+        f"Unknown test_procedure '{test_procedure}'."
+    )
+
+    eval_pids = config["test_PIDs"] if test_procedure == "hpo_test_split" \
+                else config["all_PIDs"]
+
+    print(f"\nA7 CONFIG (test_procedure={test_procedure}):")
+    print(json.dumps({k: str(v) for k, v in config.items()}, indent=2))
+    print(f"Evaluating on {len(eval_pids)} subjects: {eval_pids}")
+    print(f"Single run per subject: seed={FIXED_SEED}, seed_idx={FIXED_SEED_IDX}")
+
+    all_results = []
+    for pid in eval_pids:
+        print(f"\n{'='*70}")
+        print(f"[A7] PID={pid}  seed={FIXED_SEED}  seed_idx={FIXED_SEED_IDX}")
+        print(f"{'='*70}")
+        result = run_a7_one_subject(pid, config, tensor_dict)
+        all_results.append(result)
+
+    per_subject_head = {r["pid"]: r["mean_head_acc"] for r in all_results}
+    per_subject_full = {r["pid"]: r["mean_full_acc"] for r in all_results}
+    head_means = list(per_subject_head.values())
+    full_means = list(per_subject_full.values())
+
+    summary = {
+        "ablation_id":          "A7",
+        "description":          "Subject-Specific CNN-LSTM (Fair 1-shot Baseline)",
+        "test_procedure":       test_procedure,
+        "seed":                 FIXED_SEED,
+        "seed_idx":             FIXED_SEED_IDX,
+        "n_params":             all_results[0]["n_params"],
+        "ft_steps":             config["ft_steps"],
+        "ft_lr":                config["ft_lr"],
+        "ft_optimizer":         config["ft_optimizer"],
+        "ft_weight_decay":      config["ft_weight_decay"],
+        "cnn_base_filters":     config["cnn_base_filters"],
+        "param_match_target":   "all_experts_cnn",
+        "m0_all_expert_params": config["_m0_all_expert_params"],
+        "matched_cnn_params":   config["_a7_matched_cnn_params"],
+        "param_ratio":          config["_a7_param_ratio"],
+        "all_results":          all_results,
+        "per_subject_head_acc": per_subject_head,
+        "per_subject_full_acc": per_subject_full,
+        "mean_head_acc":        float(np.mean(head_means)),
+        "std_head_acc":         float(np.std(head_means)),
+        "mean_full_acc":        float(np.mean(full_means)),
+        "std_full_acc":         float(np.std(full_means)),
+        "n_subjects":           len(all_results),
+        "config_snapshot":      {k: str(v) for k, v in config.items()},
+    }
+    save_results(summary, config, tag="summary")
+
+    print(f"\n{'='*70}")
+    print(f"[A7] FINAL head-only ({test_procedure}) across {len(all_results)} subjects: "
+          f"{summary['mean_head_acc']*100:.2f}% ± {summary['std_head_acc']*100:.2f}%")
+    print(f"[A7] FINAL full-ft   ({test_procedure}) across {len(all_results)} subjects: "
+          f"{summary['mean_full_acc']*100:.2f}% ± {summary['std_full_acc']*100:.2f}%")
+    print(f"     single run per subject: seed={FIXED_SEED}, seed_idx={FIXED_SEED_IDX}")
+    print(f"{'='*70}")
+
+    return summary
+
+
+def run_subject_specific_ablation(ablation_id, subject_runner, config,
+                                   description, tensor_dict):
+    """
+    Generic orchestrator for A8 (single mean_acc per subject).
+    A7 uses run_a7_ablation instead.
+
+    Outer loop: iterate over eval subjects. Single run per subject (FIXED_SEED).
+
+    Which subjects are evaluated depends on test_procedure:
+      'hpo_test_split' → config['test_PIDs']  (fixed small set)
+      'L2SO'           → config['all_PIDs']   (all subjects, matches cross-subject coverage)
+    """
+    test_procedure = config["test_procedure"]
+    assert test_procedure in ("hpo_test_split", "L2SO"), (
+        f"Unknown test_procedure '{test_procedure}'."
+    )
+
+    eval_pids = config["test_PIDs"] if test_procedure == "hpo_test_split" \
+                else config["all_PIDs"]
+
+    print(f"\n{ablation_id} CONFIG (test_procedure={test_procedure}):")
+    print(json.dumps({k: str(v) for k, v in config.items()}, indent=2))
+    print(f"Evaluating on {len(eval_pids)} subjects: {eval_pids}")
+    print(f"Single run per subject: seed={FIXED_SEED}, seed_idx={FIXED_SEED_IDX}")
+
+    all_results = []
+    for pid in eval_pids:
+        print(f"\n{'='*70}")
+        print(f"[{ablation_id}] PID={pid}  seed={FIXED_SEED}  seed_idx={FIXED_SEED_IDX}")
+        print(f"{'='*70}")
+        result = subject_runner(pid, config, tensor_dict)
+        all_results.append(result)
+
+    per_subject_mean = {r["pid"]: r["mean_acc"] for r in all_results}
+    subject_means    = list(per_subject_mean.values())
+
+    summary = {
+        "ablation_id":      ablation_id,
+        "description":      description,
+        "test_procedure":   test_procedure,
+        "seed":             FIXED_SEED,
+        "seed_idx":         FIXED_SEED_IDX,
+        "n_params":         all_results[0]["n_params"],
+        "all_results":      all_results,
+        "per_subject_mean": per_subject_mean,
+        "mean_acc":         float(np.mean(subject_means)),
+        "std_acc":          float(np.std(subject_means)),
+        "n_subjects":       len(per_subject_mean),
+        "config_snapshot":  {k: str(v) for k, v in config.items()},
+    }
+    save_results(summary, config, tag="summary")
+
+    print(f"\n{'='*70}")
+    print(f"[{ablation_id}] FINAL ({test_procedure}) across {len(per_subject_mean)} subjects: "
+          f"{summary['mean_acc']*100:.2f}% ± {summary['std_acc']*100:.2f}%")
+    print(f"     single run per subject: seed={FIXED_SEED}, seed_idx={FIXED_SEED_IDX}")
+    print(f"{'='*70}")
+
+    return summary
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ablation", choices=["A7", "A8", "both"], required=True)
+    args = parser.parse_args()
+
+    config_for_path = make_base_config(ablation_id="path_resolve")
+    tensor_dict_path = os.path.join(
+        config_for_path["dfs_load_path"], "segfilt_rts_tensor_dict.pkl"
+    )
+    with open(tensor_dict_path, "rb") as f:
+        full_dict = pickle.load(f)
+    tensor_dict = reorient_tensor_dict(full_dict, config_for_path)
+
+    if args.ablation in ("A7", "both"):
+        config_a7 = build_config_a7()
+        run_a7_ablation(config_a7, tensor_dict)
+
+    if args.ablation in ("A8", "both"):
+        config_a8 = build_config_a8()
+        run_subject_specific_ablation(
+            "A8", run_a8_one_subject, config_a8,
+            description="Subject-Specific MoE (Supervised Pretrain + MAML Test-Time Eval)",
+            tensor_dict=tensor_dict,
+        )
+
+
+if __name__ == "__main__":
+    main()
